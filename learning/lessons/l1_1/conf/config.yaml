@@ -1,0 +1,7 @@
+lr: 0.001
+epoch: 3
+batch_size: 64
+
+hydra:
+  run:
+    dir: ${oc.env:OUT_ROOT,/content/drive/MyDrive/it/hydra_course}/l1_1/${now:%Y-%m-%d}/${now:%H-%M-%S}

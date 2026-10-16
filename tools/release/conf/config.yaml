@@ -1,0 +1,8 @@
+defaults:
+  - config_schema
+  - set: hydra-full-release
+  - _self_
+
+hydra:
+  job:
+    chdir: true

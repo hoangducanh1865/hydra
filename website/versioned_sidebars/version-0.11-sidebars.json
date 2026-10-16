@@ -1,0 +1,146 @@
+{
+  "docs": [
+    {
+      "type": "category",
+      "label": "About",
+      "items": [
+        {
+          "type": "doc",
+          "id": "intro"
+        }
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Tutorial",
+      "items": [
+        {
+          "type": "doc",
+          "id": "tutorial/simple_cli"
+        },
+        {
+          "type": "doc",
+          "id": "tutorial/config_file"
+        },
+        {
+          "type": "doc",
+          "id": "tutorial/config_groups"
+        },
+        {
+          "type": "doc",
+          "id": "tutorial/defaults"
+        },
+        {
+          "type": "doc",
+          "id": "tutorial/composition"
+        },
+        {
+          "type": "doc",
+          "id": "tutorial/multi-run"
+        },
+        {
+          "type": "doc",
+          "id": "tutorial/tab_completion"
+        },
+        {
+          "type": "doc",
+          "id": "tutorial/working_directory"
+        },
+        {
+          "type": "doc",
+          "id": "tutorial/logging"
+        },
+        {
+          "type": "doc",
+          "id": "tutorial/debugging"
+        }
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Common patterns",
+      "items": [
+        {
+          "type": "doc",
+          "id": "patterns/objects"
+        },
+        {
+          "type": "doc",
+          "id": "patterns/specializing_config"
+        }
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Configuring Hydra",
+      "items": [
+        {
+          "type": "doc",
+          "id": "configure_hydra/intro"
+        },
+        {
+          "type": "doc",
+          "id": "configure_hydra/logging"
+        },
+        {
+          "type": "doc",
+          "id": "configure_hydra/workdir"
+        },
+        {
+          "type": "doc",
+          "id": "configure_hydra/app_help"
+        }
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Plugins",
+      "items": [
+        {
+          "type": "doc",
+          "id": "plugins/colorlog"
+        }
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Advanced",
+      "items": [
+        {
+          "type": "doc",
+          "id": "advanced/app_packaging"
+        },
+        {
+          "type": "doc",
+          "id": "advanced/search_path"
+        },
+        {
+          "type": "doc",
+          "id": "advanced/plugins"
+        },
+        {
+          "type": "doc",
+          "id": "advanced/compose_api"
+        },
+        {
+          "type": "doc",
+          "id": "advanced/ray_example"
+        }
+      ]
+    },
+    {
+      "type": "category",
+      "label": "Development",
+      "items": [
+        {
+          "type": "doc",
+          "id": "development/contributing"
+        },
+        {
+          "type": "doc",
+          "id": "development/release"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+defaults:
+  - override hydra/env: campus
+  - _self_
+
+hydra:
+  job:
+    env_set:
+      FOO: app

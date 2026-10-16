@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - override /hydra/launcher: basic
+
+hydra:
+  job:
+    env_set:
+      FOO: campus
+  run:
+    dir: ./campus_outputs

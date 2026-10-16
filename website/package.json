@@ -1,0 +1,44 @@
+{
+  "name": "website",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "docusaurus": "docusaurus",
+    "generate:landscape": "node scripts/run-landscape-generator.mjs",
+    "start": "node scripts/run-landscape-generator.mjs && docusaurus start --port 9134",
+    "build": "node scripts/test-security-patches.mjs && node scripts/run-landscape-generator.mjs && docusaurus build",
+    "serve": "docusaurus serve",
+    "validate:landscape": "node scripts/run-landscape-generator.mjs --check && node scripts/validate-landscape.mjs",
+    "swizzle": "docusaurus swizzle",
+    "test:security-patches": "node scripts/test-security-patches.mjs"
+  },
+  "dependencies": {
+    "@docusaurus/core": "^3.10.2",
+    "@docusaurus/plugin-content-docs": "^3.10.2",
+    "@docusaurus/preset-classic": "^3.10.2",
+    "@mdx-js/react": "^3.1.1",
+    "classnames": "^2.5.1",
+    "prism-react-renderer": "^2.4.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "image-size": "2.0.4"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}

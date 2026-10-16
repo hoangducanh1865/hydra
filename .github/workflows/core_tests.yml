@@ -1,0 +1,107 @@
+name: Core tests
+on:
+  push:
+    branches:
+      - main
+      - '*_branch'
+  pull_request:
+    branches:
+      - main
+      - '*_branch'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check new-file copyright headers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python tools/copyright/check_new_files.py --base "$BASE_SHA" --head "$GITHUB_SHA"
+      - uses: "./.github/actions/linux"
+        with:
+          py_version: "3.11"
+      - name: Linting Hydra
+        run: |-
+          export PATH="$HOME/miniconda3/envs/hydra/bin:$PATH"
+          export NOX_PYTHON_VERSIONS=3.11
+          pip install nox --progress-bar off
+          nox -s lint -ts
+  test_macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        py_version:
+          - '3.10'
+          - '3.11'
+          - '3.12'
+          - '3.13'
+          - '3.14'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: "./.github/actions/macos"
+        with:
+          py_version: "${{ matrix.py_version }}"
+      - name: Testing Hydra
+        run: |-
+          source $HOME/.bash_profile
+          export NOX_PYTHON_VERSIONS=${{ matrix.py_version }}
+          conda activate hydra
+          pip install nox --progress-bar off
+            nox -s test_tools test_core \
+              test_jupyter_notebooks test_plugins -ts
+  test_linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        py_version:
+          - '3.10'
+          - '3.11'
+          - '3.12'
+          - '3.13'
+          - '3.14'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: "./.github/actions/linux"
+        with:
+          py_version: "${{ matrix.py_version }}"
+      - name: Testing Hydra
+        run: |-
+          export PATH="$HOME/miniconda3/envs/hydra/bin:$PATH"
+          export NOX_PYTHON_VERSIONS=${{ matrix.py_version }}
+          pip install nox --progress-bar off
+          nox -s test_tools test_core \
+           test_jupyter_notebooks test_plugins -ts
+  test_win:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        py_version:
+          - '3.10'
+          - '3.11'
+          - '3.12'
+          - '3.13'
+          - '3.14'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: "./.github/actions/windows"
+        with:
+          py_version: "${{ matrix.py_version }}"
+      - name: Testing Hydra
+        run: |-
+          $env:CONDA_DLL_SEARCH_MODIFICATION_ENABLE = "1"
+          conda run -n hydra pip install nox --progress-bar off
+          $env:NOX_PYTHON_VERSIONS = "${{ matrix.py_version }}"
+          $env:ConEmuDefaultCp = "65001"
+          $env:PYTHONIOENCODING = "utf_8"
+          conda run -n hydra nox -s test_tools test_core test_jupyter_notebooks test_plugins -ts
+          exit $LASTEXITCODE

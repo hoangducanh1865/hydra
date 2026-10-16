@@ -1,0 +1,1 @@
+Deprecate `LogJobReturnCallback` as a no-op; Hydra logs job failures directly.

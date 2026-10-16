@@ -1,0 +1,5 @@
+foo: bar
+
+hydra:
+  job:
+    chdir: false

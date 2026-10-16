@@ -1,0 +1,7 @@
+include hydra/py.typed
+include requirements/requirements.txt
+include ATTRIBUTION/LICENSE-antlr4
+global-exclude *.pyc
+global-exclude __pycache__
+recursive-include hydra/* *
+recursive-include build_helpers *.py *.jar

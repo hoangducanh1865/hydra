@@ -1,0 +1,813 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import copy
+import os
+import sys
+import warnings
+from textwrap import dedent
+from typing import Any, MutableSequence
+
+from omegaconf import (
+    Container,
+    DictConfig,
+    OmegaConf,
+    flag_override,
+    open_dict,
+)
+from omegaconf._utils import _get_value, split_key
+from omegaconf.errors import (
+    ConfigAttributeError,
+    ConfigKeyError,
+    OmegaConfBaseException,
+)
+from omegaconf.omegaconf import _select_one
+
+from hydra._internal.config_repository import (
+    CachingConfigRepository,
+    ConfigRepository,
+    IConfigRepository,
+)
+from hydra._internal.defaults_list import DefaultsList, create_defaults_list
+from hydra._internal.override_aliases import OverrideAliases
+from hydra.conf import ConfigSourceInfo
+from hydra.core.config_loader import ConfigLoader
+from hydra.core.config_search_path import ConfigSearchPath
+from hydra.core.default_element import ConfigDefault, ResultDefault
+from hydra.core.object_type import ObjectType
+from hydra.core.override_parser.overrides_parser import OverridesParser
+from hydra.core.override_parser.types import Override, OverrideType, ValueType
+from hydra.core.utils import JobRuntime
+from hydra.errors import (
+    ConfigCompositionException,
+    HydraException,
+    MissingConfigException,
+    OverrideParseException,
+)
+from hydra.plugins.config_source import ConfigResult, ConfigSource
+from hydra.types import RunMode
+
+
+class ConfigLoaderImpl(ConfigLoader):
+    """
+    Configuration loader
+    """
+
+    def __init__(
+        self,
+        config_search_path: ConfigSearchPath,
+    ) -> None:
+        self.config_search_path = config_search_path
+        self.repository = ConfigRepository(config_search_path=config_search_path)
+        self._active_repository: IConfigRepository | None = None
+
+    def get_override_aliases(self, config_name: str | None) -> OverrideAliases:
+        if config_name is None:
+            return OverrideAliases()
+        loaded = self.repository.load_config(config_name)
+        if loaded is None:
+            return OverrideAliases()
+        if not isinstance(loaded.config, DictConfig):
+            raise ConfigCompositionException(
+                f"primary config '{config_name}' must be a DictConfig, got {type(loaded.config).__name__}"
+            )
+        primary = ConfigDefault(path=config_name, primary=True)
+        primary.update_parent(parent_base_dir="", parent_package="")
+        primary.set_package_header(loaded.header["package"])
+        if primary.get_final_package() != "":
+            return OverrideAliases()
+        return OverrideAliases.from_config(loaded.config)
+
+    def parse_overrides(
+        self, config_name: str | None, overrides: list[str], alias_start: int = 0
+    ) -> list[Override]:
+        aliases = self.get_override_aliases(config_name)
+        expanded = overrides[:alias_start] + [
+            aliases.expand(value) for value in overrides[alias_start:]
+        ]
+        try:
+            parsed = OverridesParser.create().parse_overrides(expanded)
+        except OverrideParseException as e:
+            index = expanded.index(e.override)
+            if expanded[index] != overrides[index]:
+                raise OverrideParseException(
+                    override=overrides[index],
+                    message=f"{e}\nAlias expansion: {overrides[index]!r} -> {expanded[index]!r}",
+                ) from e
+            raise
+        for original, override in zip(overrides, parsed):
+            if original != override.input_line:
+                override.original_input_line = original
+        return parsed
+
+    @staticmethod
+    def _alias_error_context(parsed_overrides: list[Override]) -> str:
+        changes = [
+            f"  {v.original_input_line!r} -> {v.input_line!r}"
+            for v in parsed_overrides
+            if v.original_input_line is not None
+        ]
+        return "\nAlias expansion:\n" + "\n".join(changes) if changes else ""
+
+    def get_mode(
+        self,
+        config_name: str | None,
+        overrides: list[str],
+        parsed_overrides: list[Override] | None = None,
+    ) -> Any:
+        mode: Any = None
+        mode_override_found = False
+        assert parsed_overrides is not None, "parsed_overrides must be provided"
+        for override in parsed_overrides:
+            key = split_key(override.key_or_group)
+            if override.package is not None or key not in (
+                ["hydra"],
+                ["hydra", "mode"],
+            ):
+                continue
+
+            if override.is_sweep_override():
+                raise ConfigCompositionException(
+                    "Sweeping over Hydra's configuration is not supported"
+                )
+
+            value = override.value()
+            if key == ["hydra"]:
+                if not isinstance(value, dict) or "mode" not in value:
+                    continue
+                value = value["mode"]
+
+            mode = value
+            mode_override_found = True
+
+        if mode_override_found:
+            try:
+                return OmegaConf.create({"mode": mode}).mode
+            except OmegaConfBaseException as e:
+                raise ConfigCompositionException(
+                    "hydra.mode command-line override must be resolvable without "
+                    "config composition"
+                ) from e
+
+        return self._get_primary_mode(config_name)
+
+    def _get_primary_mode(self, config_name: str | None) -> Any:
+        if config_name is None:
+            return None
+
+        loaded = self.repository.load_config(config_name)
+        if loaded is None:
+            return None
+
+        primary = ConfigDefault(path=config_name, primary=True)
+        primary.update_parent(parent_base_dir="", parent_package="")
+        primary.set_package_header(loaded.header["package"])
+        if primary.get_final_package() != "":
+            return None
+
+        try:
+            mode = OmegaConf.select(
+                loaded.config,
+                "hydra.mode",
+                throw_on_resolution_failure=True,
+            )
+        except OmegaConfBaseException as e:
+            raise ConfigCompositionException(
+                "hydra.mode must be resolvable from the primary config "
+                "without composing its defaults list"
+            ) from e
+        return mode
+
+    @staticmethod
+    def validate_sweep_overrides_legal(
+        overrides: list[Override],
+        run_mode: RunMode,
+        from_shell: bool,
+    ) -> None:
+        for x in overrides:
+            if x.is_sweep_override():
+                if run_mode == RunMode.MULTIRUN:
+                    if x.is_hydra_override():
+                        raise ConfigCompositionException(
+                            "Sweeping over Hydra's configuration is not supported :"
+                            f" '{x.input_line}'"
+                        )
+                elif run_mode == RunMode.RUN:
+                    if x.value_type == ValueType.SIMPLE_CHOICE_SWEEP:
+                        vals = "value1,value2"
+                        if from_shell:
+                            example_override = f"key=\\'{vals}\\'"
+                        else:
+                            example_override = f"key='{vals}'"
+
+                        msg = dedent(f"""\
+                            Ambiguous value for argument '{x.input_line}'
+                            1. To use it as a list, use key=[value1,value2]
+                            2. To use it as string, quote the value: {example_override}
+                            3. To sweep over it, add --multirun to your command line""")
+                        raise ConfigCompositionException(msg)
+                    else:
+                        raise ConfigCompositionException(
+                            f"Sweep parameters '{x.input_line}' requires --multirun"
+                        )
+                else:
+                    assert False
+
+    def _missing_config_error(
+        self, config_name: str | None, msg: str, with_search_path: bool
+    ) -> None:
+        def add_search_path() -> str:
+            descs = []
+            for src in self.repository.get_sources():
+                if src.provider != "schema":
+                    descs.append(f"\t{repr(src)}")
+            lines = "\n".join(descs)
+
+            if with_search_path:
+                return msg + "\nSearch path:" + f"\n{lines}"
+            else:
+                return msg
+
+        raise MissingConfigException(
+            missing_cfg_file=config_name, message=add_search_path()
+        )
+
+    def ensure_main_config_source_available(self) -> None:
+        for source in self.get_sources():
+            # if specified, make sure main config search path exists
+            if source.provider == "main":
+                if not source.available():
+                    if source.scheme() == "pkg":
+                        if source.path == "":
+                            msg = (
+                                "Primary config module is empty.\nSpecify an"
+                                " importable regular Python package containing configs."
+                            )
+                        else:
+                            msg = (
+                                f"Primary config module '{source.path}' not"
+                                " found.\nCheck that it's an importable regular Python"
+                                " package containing configs."
+                            )
+                    else:
+                        msg = (
+                            "Primary config directory not found.\nCheck that the"
+                            f" config directory '{source.path}' exists and readable"
+                        )
+
+                    self._missing_config_error(
+                        config_name=None, msg=msg, with_search_path=False
+                    )
+
+    def load_configuration(
+        self,
+        config_name: str | None,
+        overrides: list[str],
+        run_mode: RunMode,
+        from_shell: bool = True,
+        validate_sweep_overrides: bool = True,
+        skip_missing_defaults: bool = False,
+    ) -> DictConfig:
+        return self._load_configuration(
+            config_name=config_name,
+            overrides=overrides,
+            run_mode=run_mode,
+            from_shell=from_shell,
+            validate_sweep_overrides=validate_sweep_overrides,
+            skip_missing_defaults=skip_missing_defaults,
+            activate_config_repository=False,
+        )
+
+    def _load_configuration(
+        self,
+        config_name: str | None,
+        overrides: list[str],
+        run_mode: RunMode,
+        from_shell: bool,
+        validate_sweep_overrides: bool,
+        skip_missing_defaults: bool,
+        activate_config_repository: bool,
+        parsed_overrides: list[Override] | None = None,
+    ) -> DictConfig:
+        if parsed_overrides is None:
+            self.ensure_main_config_source_available()
+            parsed_overrides = self.parse_overrides(config_name, overrides)
+        try:
+            return self._load_configuration_impl(
+                config_name=config_name,
+                overrides=overrides,
+                run_mode=run_mode,
+                from_shell=from_shell,
+                validate_sweep_overrides=validate_sweep_overrides,
+                skip_missing_defaults=skip_missing_defaults,
+                activate_config_repository=activate_config_repository,
+                parsed_overrides=parsed_overrides,
+            )
+        except (HydraException, ValueError) as e:
+            context = self._alias_error_context(parsed_overrides)
+            if context:
+                message = f"{e}{context}"
+                e.args = (message,)
+                if isinstance(e, OverrideParseException):
+                    e.message = message
+            raise
+        except OmegaConfBaseException as e:
+            context = self._alias_error_context(parsed_overrides)
+            if context:
+                raise ConfigCompositionException(f"{e}{context}") from e
+            raise ConfigCompositionException().with_traceback(sys.exc_info()[2]) from e
+
+    def _process_config_searchpath(
+        self,
+        config_name: str | None,
+        parsed_overrides: list[Override],
+        repo: CachingConfigRepository,
+    ) -> None:
+        if config_name is not None:
+            loaded = repo.load_config(config_path=config_name)
+            primary_config: Container
+            if loaded is None:
+                primary_config = OmegaConf.create()
+            else:
+                primary_config = loaded.config
+        else:
+            primary_config = OmegaConf.create()
+
+        if not OmegaConf.is_dict(primary_config):
+            raise ConfigCompositionException(
+                f"primary config '{config_name}' must be a DictConfig, got"
+                f" {type(primary_config).__name__}"
+            )
+
+        def is_searchpath_override(v: Override) -> bool:
+            return (
+                v.type in (OverrideType.CHANGE, OverrideType.EXTEND_LIST)
+                and v.package is None
+                and split_key(v.key_or_group) == ["hydra", "searchpath"]
+            )
+
+        override = None
+        for v in parsed_overrides:
+            if is_searchpath_override(v):
+                override = v.value()
+                break
+
+        searchpath = OmegaConf.select(primary_config, "hydra.searchpath")
+        if override is not None:
+            provider = "hydra.searchpath in command-line"
+            searchpath = override
+        else:
+            provider = "hydra.searchpath in main"
+
+        def _err() -> None:
+            raise ConfigCompositionException(
+                f"hydra.searchpath must be a list of strings. Got: {searchpath}"
+            )
+
+        if searchpath is None:
+            return
+
+        # validate hydra.searchpath.
+        # Note that we cannot rely on OmegaConf validation here because we did not yet merge with the Hydra schema node
+        if not isinstance(searchpath, MutableSequence):
+            _err()
+        for v in searchpath:
+            if not isinstance(v, str):
+                _err()
+
+        new_csp = copy.deepcopy(self.config_search_path)
+        schema = new_csp.get_path().pop(-1)
+        assert schema.provider == "schema"
+        for sp in searchpath:
+            new_csp.append(provider=provider, path=sp)
+        new_csp.append("schema", "structured://")
+        repo.initialize_sources(new_csp)
+
+        for source in repo.get_sources():
+            if not source.available():
+                warnings.warn(
+                    category=UserWarning,
+                    message=(
+                        f"provider={source.provider}, path={source.path} is not"
+                        " available."
+                    ),
+                )
+
+    def _parse_overrides_and_create_caching_repo(
+        self,
+        config_name: str | None,
+        overrides: list[str],
+        parsed_overrides: list[Override] | None = None,
+    ) -> tuple[list[Override], CachingConfigRepository]:
+        if parsed_overrides is None:
+            parsed_overrides = self.parse_overrides(config_name, overrides)
+        caching_repo = CachingConfigRepository(self.repository)
+        self._process_config_searchpath(config_name, parsed_overrides, caching_repo)
+        return parsed_overrides, caching_repo
+
+    def _load_configuration_impl(
+        self,
+        config_name: str | None,
+        overrides: list[str],
+        run_mode: RunMode,
+        from_shell: bool = True,
+        validate_sweep_overrides: bool = True,
+        skip_missing_defaults: bool = False,
+        activate_config_repository: bool = False,
+        parsed_overrides: list[Override] | None = None,
+    ) -> DictConfig:
+        from hydra import __version__, version
+
+        self.ensure_main_config_source_available()
+        parsed_overrides, caching_repo = self._parse_overrides_and_create_caching_repo(
+            config_name, overrides, parsed_overrides
+        )
+
+        if validate_sweep_overrides:
+            self.validate_sweep_overrides_legal(
+                overrides=parsed_overrides, run_mode=run_mode, from_shell=from_shell
+            )
+
+        defaults_list = create_defaults_list(
+            repo=caching_repo,
+            config_name=config_name,
+            overrides_list=parsed_overrides,
+            prepend_hydra=True,
+            skip_missing=skip_missing_defaults or run_mode == RunMode.MULTIRUN,
+        )
+
+        config_overrides = defaults_list.config_overrides
+
+        cfg = self._compose_config_from_defaults_list(
+            defaults=defaults_list.defaults, repo=caching_repo
+        )
+
+        # Set config root to struct mode.
+        # Note that this will close any dictionaries (including dicts annotated as Dict[K, V].
+        # One must use + to add new fields to them.
+        OmegaConf.set_struct(cfg, True)
+
+        # The Hydra node should not be read-only even if the root config is read-only.
+        OmegaConf.set_readonly(cfg.hydra, False)
+
+        # Apply command line overrides after enabling struct mode
+        alias_definitions = OmegaConf.to_container(cfg.hydra.aliases, resolve=False)
+        with flag_override(cfg.hydra.aliases, "readonly", True):
+            try:
+                ConfigLoaderImpl._apply_overrides_to_config(config_overrides, cfg)
+            except ConfigCompositionException as e:
+                if isinstance(e.__cause__, OmegaConfBaseException) and split_key(
+                    e.__cause__.full_key or ""
+                )[:2] == ["hydra", "aliases"]:
+                    raise ConfigCompositionException(
+                        "hydra.aliases can only be defined in the primary config; "
+                        "command-line overrides cannot change them"
+                    ) from e
+                raise
+        definitions = OmegaConf.select(cfg, "hydra.aliases")
+        if (
+            definitions is None
+            or OmegaConf.to_container(definitions, resolve=False) != alias_definitions
+        ):
+            raise ConfigCompositionException(
+                "hydra.aliases can only be defined in the primary config; "
+                "command-line overrides cannot change them"
+            )
+        for override in parsed_overrides:
+            if override.is_hydra_override():
+                cfg.hydra.overrides.hydra.append(override.input_line)
+            else:
+                cfg.hydra.overrides.task.append(override.input_line)
+
+        with open_dict(cfg.hydra):
+            cfg.hydra.runtime.choices.update(defaults_list.overrides.known_choices)
+            for key in cfg.hydra.job.env_copy:
+                cfg.hydra.job.env_set[key] = os.environ[key]
+
+        cfg.hydra.runtime.version = __version__
+        cfg.hydra.runtime.version_base = version.getbase()
+        cfg.hydra.runtime.cwd = os.getcwd()
+
+        cfg.hydra.runtime.config_sources = [
+            ConfigSourceInfo(path=x.path, schema=x.scheme(), provider=x.provider)
+            for x in caching_repo.get_sources()
+        ]
+
+        if "name" not in cfg.hydra.job:
+            cfg.hydra.job.name = JobRuntime().get("name")
+
+        cfg.hydra.job.config_name = config_name
+
+        if activate_config_repository:
+            self._active_repository = caching_repo
+
+        return cfg
+
+    def load_sweep_config(
+        self, master_config: DictConfig, sweep_overrides: list[str]
+    ) -> DictConfig:
+        # Recreate the config for this sweep instance with the appropriate overrides
+        overrides = OmegaConf.to_container(master_config.hydra.overrides.hydra)
+        assert isinstance(overrides, list)
+        overrides = overrides + sweep_overrides
+        # Sweep overrides are already expanded in the master config. Do not
+        # expand again: a target may also happen to be another alias name.
+        sweep_config = self._load_configuration(
+            config_name=master_config.hydra.job.config_name,
+            overrides=overrides,
+            run_mode=RunMode.RUN,
+            from_shell=True,
+            validate_sweep_overrides=True,
+            skip_missing_defaults=False,
+            activate_config_repository=False,
+            parsed_overrides=OverridesParser.create().parse_overrides(overrides),
+        )
+        ConfigLoaderImpl._ensure_sweep_config_controller_unchanged(
+            master_config=master_config,
+            sweep_config=sweep_config,
+        )
+
+        # Copy old config cache to ensure we get the same resolved values (for things
+        # like timestamps etc). Since `oc.env` does not cache environment variables
+        # (but the deprecated `env` resolver did), the entire config should be copied
+        OmegaConf.copy_cache(from_config=master_config, to_config=sweep_config)
+
+        return sweep_config
+
+    @staticmethod
+    def _ensure_sweep_config_controller_unchanged(
+        master_config: DictConfig, sweep_config: DictConfig
+    ) -> None:
+        controller_groups = (
+            ("hydra/launcher", "launcher"),
+            ("hydra/sweeper", "sweeper"),
+        )
+        master_choices = master_config.hydra.runtime.choices
+        sweep_choices = sweep_config.hydra.runtime.choices
+        for group, node in controller_groups:
+            master_choice = master_choices.get(group)
+            sweep_choice = sweep_choices.get(group)
+            if master_choice != sweep_choice:
+                # Bandit mistakes this user-facing message for a SQL snippet.
+                raise ConfigCompositionException(
+                    f"'{group}' must be selected before the sweep starts, "  # nosec B608
+                    f"but a swept job config changed it from "
+                    f"'{master_choice}' to '{sweep_choice}'. Select it in "
+                    "the primary config or from the command line."
+                )
+            if not OmegaConf.structural_equality(
+                master_config.hydra[node], sweep_config.hydra[node]
+            ):
+                raise ConfigCompositionException(
+                    f"'hydra.{node}' must be configured before the sweep starts, "
+                    "but a swept job config changed it. Configure it in the "
+                    "primary config or from the command line."
+                )
+
+    def get_search_path(self) -> ConfigSearchPath:
+        return self.config_search_path
+
+    @staticmethod
+    def _apply_overrides_to_config(overrides: list[Override], cfg: DictConfig) -> None:
+        for override in overrides:
+            if override.package is not None:
+                raise ConfigCompositionException(
+                    f"Override {override.input_line} looks like a config group"
+                    f" override, but config group '{override.key_or_group}' does not"
+                    " exist."
+                )
+
+            key = override.key_or_group
+            value = override.value()
+            try:
+                if override.is_delete():
+                    try:
+                        parent, node_key, node = cfg._select_impl(
+                            key,
+                            throw_on_missing=False,
+                            throw_on_resolution_failure=True,
+                        )
+                    except TypeError:
+                        # A scalar parent or non-integer list index cannot
+                        # contain the target (ConfigTypeError is a TypeError).
+                        parent, node_key, node = None, None, None
+
+                    if parent is None or node is None:
+                        # Bandit mistakes this user-facing message for a SQL snippet.
+                        raise ConfigCompositionException(
+                            f"Could not delete from config. '{override.key_or_group}'"  # nosec B608
+                            " does not exist."
+                        )
+                    config_val_for_match = (
+                        "???" if node._is_missing() else _get_value(node)
+                    )
+                    if override.value_type is not None and isinstance(
+                        config_val_for_match, Container
+                    ):
+                        # Resolve a copy so matching retains container interpolation
+                        # behavior without changing the config when deletion fails.
+                        config_val_for_match = copy.deepcopy(config_val_for_match)
+                        OmegaConf.resolve(config_val_for_match)
+                    if (
+                        override.value_type is not None
+                        and not OmegaConf.structural_equality(
+                            OmegaConf.create({"value": config_val_for_match}),
+                            OmegaConf.create({"value": value}),
+                        )
+                    ):
+                        # Bandit mistakes this user-facing message for a SQL snippet.
+                        raise ConfigCompositionException(
+                            "Could not delete from config. The value of"  # nosec B608
+                            f" '{override.key_or_group}' is {config_val_for_match} and not"
+                            f" {value}."
+                        )
+
+                    with open_dict(cfg):
+                        assert node_key is not None
+                        _, delete_key = _select_one(
+                            parent, node_key, throw_on_missing=False
+                        )
+                        del parent[delete_key]
+
+                elif override.is_add():
+                    if OmegaConf.select(
+                        cfg, key, throw_on_missing=False
+                    ) is None or isinstance(value, (dict, list)):
+                        OmegaConf.update(cfg, key, value, merge=True, force_add=True)
+                    else:
+                        assert override.input_line is not None
+                        raise ConfigCompositionException(
+                            dedent(f"""\
+                        Could not append to config. An item is already at '{override.key_or_group}'.
+                        Either remove + prefix: '{override.input_line[1:]}'
+                        Or add a second + to add or override '{override.key_or_group}': '+{override.input_line}'
+                        """)
+                        )
+                elif override.is_force_add():
+                    OmegaConf.update(cfg, key, value, merge=True, force_add=True)
+                elif override.is_list_extend():
+                    config_val = OmegaConf.select(cfg, key, throw_on_missing=True)
+                    if not OmegaConf.is_list(config_val):
+                        raise ConfigCompositionException(
+                            "Could not append to config list. The existing value of"
+                            f" '{override.key_or_group}' is {config_val} which is not"
+                            f" a list."
+                        )
+                    config_val.extend(value)
+                else:
+                    try:
+                        OmegaConf.update(cfg, key, value, merge=True)
+                    except (ConfigAttributeError, ConfigKeyError) as ex:
+                        raise ConfigCompositionException(
+                            f"Could not override '{override.key_or_group}'."
+                            f"\nTo append to your config use +{override.input_line}"
+                        ) from ex
+            except OmegaConfBaseException as ex:
+                raise ConfigCompositionException(
+                    f"Error merging override {override.input_line}"
+                ).with_traceback(sys.exc_info()[2]) from ex
+
+    def _load_single_config(
+        self, default: ResultDefault, repo: IConfigRepository
+    ) -> ConfigResult:
+        config_path = default.config_path
+
+        assert config_path is not None
+        ret = repo.load_config(config_path=config_path)
+        assert ret is not None
+
+        if not OmegaConf.is_config(ret.config):
+            raise ValueError(
+                f"Config {config_path} must be an OmegaConf config, got"
+                f" {type(ret.config).__name__}"
+            )
+
+        res = self._embed_result_config(ret, default.package)
+        if (
+            not default.primary
+            and config_path != "hydra/config"
+            and isinstance(res.config, DictConfig)
+            and OmegaConf.select(res.config, "hydra.searchpath") is not None
+        ):
+            raise ConfigCompositionException(
+                f"In '{config_path}': Overriding hydra.searchpath is only supported"
+                " from the primary config"
+            )
+
+        if (
+            not default.primary
+            and config_path != "hydra/config"
+            and isinstance(res.config, DictConfig)
+            and OmegaConf.select(res.config, "hydra.aliases") is not None
+        ):
+            raise ConfigCompositionException(
+                f"In '{config_path}': hydra.aliases can only be defined "
+                "in the primary config"
+            )
+
+        return res
+
+    @staticmethod
+    def _embed_result_config(
+        ret: ConfigResult, package_override: str | None
+    ) -> ConfigResult:
+        package = ret.header["package"]
+        if package_override is not None:
+            package = package_override
+
+        if package is not None and package != "":
+            cfg = OmegaConf.create()
+            OmegaConf.update(cfg, package, ret.config, merge=False)
+            ret = copy.copy(ret)
+            ret.config = cfg
+
+        return ret
+
+    def list_groups(self, parent_name: str) -> list[str]:
+        return self.get_group_options(
+            group_name=parent_name, results_filter=ObjectType.GROUP
+        )
+
+    def get_group_options(
+        self,
+        group_name: str,
+        results_filter: ObjectType | None = ObjectType.CONFIG,
+        config_name: str | None = None,
+        overrides: list[str] | None = None,
+    ) -> list[str]:
+        if (
+            config_name is None
+            and overrides is None
+            and self._active_repository is not None
+        ):
+            return self._active_repository.get_group_options(group_name, results_filter)
+        if overrides is None:
+            overrides = []
+        _, caching_repo = self._parse_overrides_and_create_caching_repo(
+            config_name, overrides
+        )
+        return caching_repo.get_group_options(group_name, results_filter)
+
+    def _compose_config_from_defaults_list(
+        self,
+        defaults: list[ResultDefault],
+        repo: IConfigRepository,
+    ) -> DictConfig:
+        cfg = OmegaConf.create()
+        with flag_override(cfg, "no_deepcopy_set_nodes", True):
+            for default in defaults:
+                loaded = self._load_single_config(default=default, repo=repo)
+                try:
+                    cfg.merge_with(loaded.config)
+                except OmegaConfBaseException as e:
+                    raise ConfigCompositionException(
+                        f"In '{default.config_path}': {type(e).__name__} raised while"
+                        f" composing config:\n{e}"
+                    ).with_traceback(sys.exc_info()[2])
+
+        # # remove remaining defaults lists from all nodes.
+        def strip_defaults(cfg: Any) -> None:
+            if isinstance(cfg, DictConfig):
+                if cfg._is_missing() or cfg._is_none():
+                    return
+                with flag_override(cfg, ["readonly", "struct"], False):
+                    if cfg._get_flag("HYDRA_REMOVE_TOP_LEVEL_DEFAULTS"):
+                        cfg._set_flag("HYDRA_REMOVE_TOP_LEVEL_DEFAULTS", None)
+                        cfg.pop("defaults", None)
+
+                for _key, value in cfg.items_ex(resolve=False):
+                    strip_defaults(value)
+
+        strip_defaults(cfg)
+
+        return cfg
+
+    def get_sources(self) -> list[ConfigSource]:
+        if self._active_repository is not None:
+            return self._active_repository.get_sources()
+        return self.repository.get_sources()
+
+    def compute_defaults_list(
+        self,
+        config_name: str | None,
+        overrides: list[str],
+        run_mode: RunMode,
+    ) -> DefaultsList:
+        return self._compute_defaults_list(config_name, overrides, run_mode)
+
+    def _compute_defaults_list(
+        self,
+        config_name: str | None,
+        overrides: list[str],
+        run_mode: RunMode,
+        parsed_overrides: list[Override] | None = None,
+    ) -> DefaultsList:
+        parsed_overrides, caching_repo = self._parse_overrides_and_create_caching_repo(
+            config_name, overrides, parsed_overrides
+        )
+        defaults_list = create_defaults_list(
+            repo=caching_repo,
+            config_name=config_name,
+            overrides_list=parsed_overrides,
+            prepend_hydra=True,
+            skip_missing=run_mode == RunMode.MULTIRUN,
+        )
+        return defaults_list

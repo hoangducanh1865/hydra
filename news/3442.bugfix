@@ -1,0 +1,3 @@
+Prevent configuration from accessing or modifying Hydra execution-policy state.
+Validate policy integrity before resolving configured targets.
+Prevent declarative configuration from mutating the process environment.

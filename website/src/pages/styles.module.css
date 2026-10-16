@@ -1,0 +1,223 @@
+/**
+ * Copyright (c) 2017-present, Facebook, Inc.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+/**
+ * CSS files with the .module.css suffix will be treated as CSS modules
+ * and scoped locally.
+ */
+
+.heroBanner {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(560px, 2fr);
+  text-align: left;
+  overflow: hidden;
+}
+
+.heroIntro {
+  position: relative;
+  min-height: 40vh;
+}
+
+.topArea {
+  display: block;
+}
+
+.topContent {
+  min-width: 0;
+}
+
+.heroLeft {
+  position: absolute;
+  top: 0; bottom: 0; left: 0; right: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.heroRight {
+  margin-left: 50%;
+  margin-top: 7vh;
+}
+
+.buttonContainer {
+  margin-bottom: 7vh;
+  text-align: center;
+}
+
+.buttons {
+  display: flex;
+  align-items: center;
+}
+
+.buttons > * {
+  margin: 10px 0;
+}
+
+.features {
+  display: flex;
+  align-items: center;
+  padding: 3rem 0px;
+  width: 100%;
+}
+
+.feature {
+  padding: 0 20px;
+}
+
+.featureImage {
+  height: 200px;
+  width: 200px;
+}
+
+.feature h3 {
+  text-transform: capitalize;
+  font-size: 1.7rem;
+  color: #276475;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.imageLogo {
+  margin-top: 5vh;
+  width: 40vw;
+  margin: 5vh auto;
+  max-width: 450px;
+  min-width: 300px;
+}
+
+.getStarted {
+  margin-right: 20px;
+}
+
+.featuredProjects {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 1.5rem 0;
+  border-left: 1px solid rgb(39 100 117 / 18%);
+}
+
+.featuredHeader {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.featuredHeader h2 {
+  margin: 0;
+  color: #276475;
+  font-size: 1.35rem;
+  line-height: 1.2;
+}
+
+.featuredHeader p {
+  margin: 0.2rem 0 0;
+  color: #235563;
+  font-size: 0.8rem;
+}
+
+.projectList {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.projectCard {
+  display: block;
+  padding: 1rem;
+  border: 1px solid rgb(39 100 117 / 28%);
+  border-radius: var(--ifm-global-radius);
+  background: rgb(255 255 255 / 12%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 22%);
+  color: #173f4a;
+  text-decoration: none;
+  transition:
+    background var(--ifm-transition-fast),
+    border-color var(--ifm-transition-fast);
+}
+
+.projectCard:hover {
+  border-color: rgb(39 100 117 / 42%);
+  background: rgb(255 255 255 / 18%);
+  color: #173f4a;
+  text-decoration: none;
+}
+
+.projectCard h3 {
+  margin: 0.15rem 0 0.4rem;
+  color: #276475;
+  font-size: 1rem;
+  line-height: 1.25;
+}
+
+.projectCard p:last-child {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.projectMeta {
+  color: #235563;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.landscapeLink {
+  color: #235563;
+  font-size: 0.82rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.landscapeLink:hover {
+  color: #173f4a;
+}
+
+@media screen and (max-width: 1200px) {
+  .heroBanner {
+    display: block;
+  }
+
+  .featuredProjects {
+    border-top: 1px solid rgb(39 100 117 / 18%);
+    border-left: 0;
+  }
+}
+
+@media screen and (max-width: 768px) {
+  .heroBanner {
+    text-align: center;
+  }
+
+  .heroLeft {
+    position: relative;
+  }
+  .heroRight {
+    margin-left: 0;
+    margin-top: -15px;
+  }
+  .buttons {
+    flex-direction: column;
+  }
+
+  .featuredHeader {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .projectList {
+    grid-template-columns: 1fr;
+  }
+}

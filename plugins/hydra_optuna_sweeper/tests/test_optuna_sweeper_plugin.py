@@ -1,0 +1,692 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import functools
+import math
+import os
+import sys
+import warnings
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch, sentinel
+
+import numpy
+import optuna
+from hydra import compose, initialize
+from hydra.core.override_parser.overrides_parser import OverridesParser
+from hydra.core.override_parser.types import RangeSweep
+from hydra.core.plugins import Plugins
+from hydra.errors import InstantiationException
+from hydra.plugins.sweeper import Sweeper
+from hydra.test_utils.test_utils import (
+    TSweepRunner,
+    chdir_plugin_root,
+    run_process,
+    run_python_script,
+)
+from hydra.utils import execution_whitelist, instantiate
+from omegaconf import DictConfig, OmegaConf
+from optuna.distributions import (
+    BaseDistribution,
+    CategoricalDistribution,
+    FloatDistribution,
+    IntDistribution,
+)
+from pytest import mark, param, raises, warns
+
+from hydra_plugins.hydra_optuna_sweeper import _impl
+from hydra_plugins.hydra_optuna_sweeper.config import (
+    CmaEsSamplerConfig,
+    GridSamplerConfig,
+    MOTPESamplerConfig,
+    NSGAIIISamplerConfig,
+    NSGAIISamplerConfig,
+    TPESamplerConfig,
+)
+from hydra_plugins.hydra_optuna_sweeper.optuna_sweeper import OptunaSweeper
+
+chdir_plugin_root()
+
+SQLALCHEMY_UTC_WARNING_FILTER = (
+    r"-W ignore:datetime.datetime.utcfromtimestamp() is deprecated:"
+    r"DeprecationWarning:sqlalchemy.sql.sqltypes"
+)
+OPTUNA_EXPERIMENTAL_WARNING_FILTER = "-W default:NSGAIIISampler is experimental"
+
+
+def run_optuna_script(cmd: list[str]) -> None:
+    run_python_script(
+        [
+            SQLALCHEMY_UTC_WARNING_FILTER,
+            OPTUNA_EXPERIMENTAL_WARNING_FILTER,
+            *cmd,
+        ]
+    )
+
+
+def test_discovery() -> None:
+    assert OptunaSweeper.__name__ in [
+        x.__name__ for x in Plugins.instance().discover(Sweeper)
+    ]
+
+
+@mark.parametrize(
+    "config_type, field_name, expected",
+    [
+        (GridSamplerConfig, "seed", None),
+        (TPESamplerConfig, "group", False),
+        (TPESamplerConfig, "constant_liar", False),
+        (TPESamplerConfig, "constraints_func", None),
+        (CmaEsSamplerConfig, "n_startup_trials", 1),
+        (CmaEsSamplerConfig, "popsize", None),
+        (CmaEsSamplerConfig, "with_margin", False),
+        (CmaEsSamplerConfig, "lr_adapt", False),
+        (CmaEsSamplerConfig, "inc_popsize", -1),
+        (NSGAIISamplerConfig, "crossover", None),
+    ],
+)
+def test_sampler_config_defaults(
+    config_type: Any, field_name: str, expected: Any
+) -> None:
+    assert getattr(config_type(), field_name) == expected
+
+
+@mark.parametrize(
+    "sampler_name, field_override, expected",
+    [
+        ("grid", "seed=123", 123),
+        ("tpe", "group=true", True),
+        ("tpe", "constant_liar=true", True),
+        (
+            "tpe",
+            "constraints_func=test_constraints",
+            "test_constraints",
+        ),
+        ("cmaes", "n_startup_trials=7", 7),
+        ("cmaes", "popsize=12", 12),
+        ("cmaes", "with_margin=true", True),
+        ("cmaes", "lr_adapt=true", True),
+        (
+            "nsgaii",
+            "crossover=test_crossover",
+            "test_crossover",
+        ),
+    ],
+)
+def test_sampler_normal_override(
+    sampler_name: str,
+    field_override: str,
+    expected: Any,
+) -> None:
+    field_name = field_override.split("=", maxsplit=1)[0]
+    with initialize(config_path="conf"):
+        cfg = compose(
+            config_name="test_grid",
+            return_hydra_config=True,
+            overrides=[
+                f"hydra/sweeper/sampler={sampler_name}",
+                f"hydra.sweeper.sampler.{field_override}",
+            ],
+        )
+
+    assert cfg.hydra.sweeper.sampler[field_name] == expected
+
+
+def test_default_cmaes_config_has_no_restart_deprecation_warning() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        instantiate(
+            OmegaConf.structured(CmaEsSamplerConfig),
+            _execution_whitelist_="optuna.samplers.*",
+        )
+
+    messages = [str(warning.message).lower() for warning in caught]
+    assert not any(
+        "inc_popsize" in message
+        or ("restart_strategy" in message and "deprecat" in message)
+        for message in messages
+    )
+
+
+def check_distribution(expected: BaseDistribution, actual: BaseDistribution) -> None:
+    if not isinstance(expected, CategoricalDistribution):
+        assert expected == actual
+        return
+
+    assert isinstance(actual, CategoricalDistribution)
+    # shuffle() will randomize the order of items in choices.
+    assert set(expected.choices) == set(actual.choices)
+
+
+@mark.parametrize(
+    "input, expected",
+    [
+        ("key=choice(1,2)", CategoricalDistribution([1, 2])),
+        ("key=choice(true, false)", CategoricalDistribution([True, False])),
+        ("key=choice('hello', 'world')", CategoricalDistribution(["hello", "world"])),
+        ("key=shuffle(range(1,3))", CategoricalDistribution((1, 2))),
+        ("key=range(1,3)", IntDistribution(1, 2)),
+        ("key=interval(1, 5)", FloatDistribution(1, 5)),
+        ("key=int(interval(1, 5))", IntDistribution(1, 5)),
+        ("key=tag(log, interval(1, 5))", FloatDistribution(1, 5, log=True)),
+        ("key=tag(log, int(interval(1, 5)))", IntDistribution(1, 5, log=True)),
+        ("key=range(0.5, 5.5, step=1)", FloatDistribution(0.5, 4.5, step=1)),
+    ],
+)
+def test_create_optuna_distribution_from_override(input: Any, expected: Any) -> None:
+    parser = OverridesParser.create()
+    parsed = parser.parse_overrides([input])[0]
+    actual = _impl.create_optuna_distribution_from_override(parsed)
+    check_distribution(expected, actual)
+
+
+@mark.parametrize(
+    "expression,values,distribution_type",
+    [
+        ("range(1,3)", [1, 2], IntDistribution),
+        ("range(0,8,3)", [0, 3, 6], IntDistribution),
+        ("range(3,0,-1)", [1, 2, 3], IntDistribution),
+        ("range(0,1,0.5)", [0.0, 0.5], FloatDistribution),
+        ("range(0,1,0.3)", [0.0, 0.3, 0.6, 0.9], FloatDistribution),
+        ("range(1,0,-0.3)", [0.1, 0.4, 0.7, 1.0], FloatDistribution),
+        ("range(0,1,0.1)", [i / 10 for i in range(10)], FloatDistribution),
+        ("sort(range(1,0,-0.25))", [0.25, 0.5, 0.75, 1.0], FloatDistribution),
+        (
+            "sort(range(0,1,0.25),reverse=true)",
+            [0.0, 0.25, 0.5, 0.75],
+            FloatDistribution,
+        ),
+        ("range(2,3,4)", [2], IntDistribution),
+        ("range(0.5,1,2)", [0.5], FloatDistribution),
+        ("int(range(0,5,1.5))", [0, 1, 3, 4], CategoricalDistribution),
+        ("int(range(0,1,0.25))", [0, 0, 0, 0], CategoricalDistribution),
+        ("float(range(1,3))", [1.0, 2.0], CategoricalDistribution),
+        ("float(int(range(0,1,0.25)))", [0.0, 0.0, 0.0, 0.0], CategoricalDistribution),
+        ("shuffle(range(1,3))", [1, 2], CategoricalDistribution),
+        ("sort(shuffle(range(1,3)))", [1, 2], IntDistribution),
+    ],
+)
+def test_range_distribution_values(
+    expression: str,
+    values: list[int | float],
+    distribution_type: type[BaseDistribution],
+) -> None:
+    override = OverridesParser.create().parse_override(f"key={expression}")
+    distribution = _impl.create_optuna_distribution_from_override(override)
+    assert isinstance(distribution, distribution_type)
+    grid = _impl.OptunaSweeperImpl._to_grid_sampler_choices(distribution)
+    assert sorted(grid) == values
+    assert [type(value) for value in sorted(grid)] == [type(value) for value in values]
+    sweep = override.value()
+    assert isinstance(sweep, RangeSweep)
+    assert sorted(sweep) == values
+
+
+@mark.parametrize(
+    "expression",
+    [
+        "range(0,1,0)",
+        "range(0,1,0.0)",
+        "int(range(0,1,0.0))",
+        "shuffle(range(0,1,0))",
+        "range(0,0)",
+        "range(3,1)",
+        "range(0,1,-0.5)",
+    ],
+)
+def test_invalid_optuna_range(expression: str) -> None:
+    override = OverridesParser.create().parse_override(f"key={expression}")
+    with raises(ValueError):
+        _impl.create_optuna_distribution_from_override(override)
+
+
+def test_numeric_range_conversion_does_not_enumerate() -> None:
+    override = OverridesParser.create().parse_override("key=range(0,1000000000000)")
+    with patch.object(RangeSweep, "__iter__", side_effect=AssertionError("enumerated")):
+        distribution = _impl.create_optuna_distribution_from_override(override)
+    assert distribution == IntDistribution(0, 999999999999)
+
+
+@mark.parametrize(
+    "expression,expected",
+    [
+        (
+            "range(-1000000000000000.0,1e-15,1.0)",
+            FloatDistribution(-1000000000000000.0, 0.0, step=1.0),
+        ),
+        (
+            "range(1000000000000000.0,-1e-15,-1.0)",
+            FloatDistribution(0.0, 1000000000000000.0, step=1.0),
+        ),
+    ],
+)
+def test_float_range_length_ignores_decimal_context_rounding(
+    expression: str, expected: FloatDistribution
+) -> None:
+    override = OverridesParser.create().parse_override(f"key={expression}")
+    with patch.object(RangeSweep, "__iter__", side_effect=AssertionError("enumerated")):
+        distribution = _impl.create_optuna_distribution_from_override(override)
+    assert distribution == expected
+
+
+def test_float_range_precision_boundary_uses_exact_categorical_values() -> None:
+    override = OverridesParser.create().parse_override(
+        "key=range(-1000000000000000.0,-999999999999999.5,0.3)"
+    )
+    distribution = _impl.create_optuna_distribution_from_override(override)
+    assert isinstance(distribution, CategoricalDistribution)
+    assert distribution.choices == (-1000000000000000.0, -999999999999999.8)
+
+
+@mark.parametrize(
+    "distribution,values",
+    [
+        (IntDistribution(1, 3), [1, 2, 3]),
+        (IntDistribution(2, 2), [2]),
+        (FloatDistribution(0.0, 0.3, step=0.1), [0.0, 0.1, 0.2, 0.3]),
+        (FloatDistribution(0.5, 0.5, step=1.0), [0.5]),
+        (CategoricalDistribution([0, 0, 1]), [0, 0, 1]),
+    ],
+)
+def test_grid_sampler_includes_distribution_endpoints(
+    distribution: BaseDistribution, values: list[int | float]
+) -> None:
+    assert (
+        list(_impl.OptunaSweeperImpl._to_grid_sampler_choices(distribution)) == values
+    )
+
+
+def test_float_grid_choices_stay_within_precision_boundary() -> None:
+    with warns(UserWarning, match="range is not divisible"):
+        distribution = FloatDistribution(
+            -1000000000000000.0,
+            -999999999999999.2,
+            step=0.07,
+        )
+    choices = _impl.OptunaSweeperImpl._to_grid_sampler_choices(distribution)
+    assert choices[-1] == distribution.high
+    assert all(distribution.low <= value <= distribution.high for value in choices)
+
+
+@mark.parametrize(
+    "input, expected",
+    [
+        (["key=choice(1,2)"], ({"key": CategoricalDistribution([1, 2])}, {}, [])),
+        (["key=5"], ({}, {"key": "5"}, [])),
+        (
+            ["key1=choice(1,2)", "key2=5"],
+            ({"key1": CategoricalDistribution([1, 2])}, {"key2": "5"}, []),
+        ),
+        (
+            ["key1=choice(1,2)", "key2=5", "key3=range(1,3)"],
+            (
+                {
+                    "key1": CategoricalDistribution([1, 2]),
+                    "key3": IntDistribution(1, 2),
+                },
+                {"key2": "5"},
+                [],
+            ),
+        ),
+        (["~z"], ({}, {}, ["~z"])),
+        (["~z=10"], ({}, {}, ["~z=10"])),
+    ],
+)
+def test_create_params_from_overrides(input: Any, expected: Any) -> None:
+    actual = _impl.create_params_from_overrides(input)
+    assert actual == expected
+
+
+def test_launch_jobs(hydra_sweep_runner: TSweepRunner) -> None:
+    sweep = hydra_sweep_runner(
+        calling_file=None,
+        calling_module="hydra.test_utils.a_module",
+        config_path="configs",
+        config_name="compose.yaml",
+        task_function=None,
+        overrides=[
+            "hydra/sweeper=optuna",
+            "hydra/launcher=basic",
+            "hydra.sweeper.n_trials=8",
+            "hydra.sweeper.n_jobs=3",
+        ],
+    )
+    with sweep:
+        assert sweep.returns is None
+
+
+@mark.parametrize("with_commandline", (True, False))
+def test_optuna_example(with_commandline: bool, tmpdir: Path) -> None:
+    storage = "sqlite:///" + os.path.join(str(tmpdir), "test.db")
+    study_name = "test-optuna-example"
+    cmd = [
+        "example/sphere.py",
+        "--multirun",
+        "hydra.sweep.dir=" + str(tmpdir),
+        "hydra.job.chdir=True",
+        "hydra.sweeper.n_trials=20",
+        "hydra.sweeper.n_jobs=1",
+        f"hydra.sweeper.storage={storage}",
+        f"hydra.sweeper.study_name={study_name}",
+        "hydra/sweeper/sampler=tpe",
+        "hydra.sweeper.sampler.seed=123",
+        "~z",
+    ]
+    if with_commandline:
+        cmd += [
+            "x=choice(0, 1, 2)",
+            "y=0",  # Fixed parameter
+        ]
+    run_optuna_script(cmd)
+    returns = OmegaConf.load(f"{tmpdir}/optimization_results.yaml")
+    study = optuna.load_study(storage=storage, study_name=study_name)
+    best_trial = study.best_trial
+    assert isinstance(returns, DictConfig)
+    assert returns.name == "optuna"
+    assert returns["best_params"]["x"] == best_trial.params["x"]
+    if with_commandline:
+        assert "y" not in returns["best_params"]
+        assert "y" not in best_trial.params
+    else:
+        assert returns["best_params"]["y"] == best_trial.params["y"]
+    assert returns["best_value"] == best_trial.value
+    # Check the search performance of the TPE sampler.
+    # The threshold is the 95th percentile calculated with 1000 different seed values
+    # to make the test robust against the detailed implementation of the sampler.
+    # See https://github.com/facebookresearch/hydra/pull/1746#discussion_r681549830.
+    assert returns["best_value"] <= 2.27
+
+
+@mark.parametrize("num_trials", (10, 1))
+def test_example_with_grid_sampler(
+    tmpdir: Path,
+    num_trials: int,
+) -> None:
+    storage = "sqlite:///" + os.path.join(str(tmpdir), "test.db")
+    study_name = "test-grid-sampler"
+    cmd = [
+        "example/sphere.py",
+        "--multirun",
+        "--config-dir=tests/conf",
+        "--config-name=test_grid",
+        "hydra.sweep.dir=" + str(tmpdir),
+        "hydra.job.chdir=False",
+        f"hydra.sweeper.n_trials={num_trials}",
+        "hydra.sweeper.n_jobs=1",
+        f"hydra.sweeper.storage={storage}",
+        f"hydra.sweeper.study_name={study_name}",
+        "hydra.sweeper.sampler.seed=123",
+    ]
+    run_optuna_script(cmd)
+    returns = OmegaConf.load(f"{tmpdir}/optimization_results.yaml")
+    assert isinstance(returns, DictConfig)
+    bv, bx, by, bz = (
+        returns["best_value"],
+        returns["best_params"]["x"],
+        returns["best_params"]["y"],
+        returns["best_params"]["z"],
+    )
+    if num_trials >= 12:
+        assert bv == 1 and abs(bx) == 1 and by == 0
+    else:
+        assert bx in [-1, 1] and by in [-1, 0]
+    assert bz in ["foo", "bar"]
+
+
+@mark.parametrize("sampler", ("random", "nsgaiii"))
+@mark.parametrize("with_commandline", (True, False))
+def test_optuna_multi_objective_example(
+    sampler: str,
+    with_commandline: bool,
+    tmpdir: Path,
+) -> None:
+    cmd = [
+        "example/multi-objective.py",
+        "--multirun",
+        "hydra.sweep.dir=" + str(tmpdir),
+        "hydra.job.chdir=True",
+        "hydra.sweeper.n_trials=20",
+        "hydra.sweeper.n_jobs=1",
+        f"hydra/sweeper/sampler={sampler}",
+        "hydra.sweeper.sampler.seed=123",
+    ]
+    if with_commandline:
+        cmd += [
+            "x=range(0, 5)",
+            "y=range(0, 3)",
+        ]
+    run_optuna_script(cmd)
+    returns = OmegaConf.load(f"{tmpdir}/optimization_results.yaml")
+    assert isinstance(returns, DictConfig)
+    assert returns.name == "optuna"
+    if with_commandline:
+        for trial_x in returns["solutions"]:
+            assert trial_x["params"]["x"] % 1 == 0
+            assert trial_x["params"]["y"] % 1 == 0
+            # The trials must not dominate each other.
+            for trial_y in returns["solutions"]:
+                assert not _dominates(trial_x, trial_y)
+    else:
+        for trial_x in returns["solutions"]:
+            assert trial_x["params"]["x"] % 1 in {0, 0.5}
+            assert trial_x["params"]["y"] % 1 in {0, 0.5}
+            # The trials must not dominate each other.
+            for trial_y in returns["solutions"]:
+                assert not _dominates(trial_x, trial_y)
+
+
+def _dominates(values_x: list[float], values_y: list[float]) -> bool:
+    return all(x <= y for x, y in zip(values_x, values_y)) and any(
+        x < y for x, y in zip(values_x, values_y)
+    )
+
+
+def test_optuna_custom_search_space_example(tmpdir: Path) -> None:
+    max_z_difference_from_x = 0.3
+    cmd = [
+        "example/custom-search-space-objective.py",
+        "--multirun",
+        "hydra.sweep.dir=" + str(tmpdir),
+        "hydra.job.chdir=True",
+        "hydra.sweeper.n_trials=20",
+        "hydra.sweeper.n_jobs=1",
+        "hydra/sweeper/sampler=random",
+        "hydra.sweeper.sampler.seed=123",
+        f"max_z_difference_from_x={max_z_difference_from_x}",
+    ]
+    run_optuna_script(cmd)
+    returns = OmegaConf.load(f"{tmpdir}/optimization_results.yaml")
+    assert isinstance(returns, DictConfig)
+    assert returns.name == "optuna"
+    assert (
+        abs(returns["best_params"]["x"] - returns["best_params"]["z"])
+        <= max_z_difference_from_x
+    )
+    w = returns["best_params"]["+w"]
+    assert 0 <= w <= 1
+
+
+def test_custom_search_space_is_resolved_through_instantiate() -> None:
+    def create_sweeper(custom_search_space: str) -> _impl.OptunaSweeperImpl:
+        return _impl.OptunaSweeperImpl(
+            sampler=optuna.samplers.RandomSampler(),
+            direction="minimize",
+            storage=None,
+            study_name=None,
+            n_trials=1,
+            n_jobs=1,
+            max_failure_rate=0.0,
+            custom_search_space=custom_search_space,
+            params=None,
+        )
+
+    with raises(InstantiationException, match="os.system"):
+        create_sweeper("os.system")
+
+    callback = (
+        "hydra_plugins.hydra_optuna_sweeper._impl."
+        "create_optuna_distribution_from_override"
+    )
+    with execution_whitelist([]):
+        with raises(
+            InstantiationException, match="not in the Hydra execution whitelist"
+        ):
+            create_sweeper(callback)
+
+    with execution_whitelist(callback):
+        sweeper = create_sweeper(callback)
+    extender = sweeper.custom_search_space_extender
+    assert isinstance(extender, functools.partial)
+    assert extender.func is _impl.create_optuna_distribution_from_override
+
+
+@mark.parametrize("max_failure_rate", (0.5, 1.0))
+def test_failure_rate(max_failure_rate: float, tmpdir: Path) -> None:
+    cmd = [
+        sys.executable,
+        "example/sphere.py",
+        "--multirun",
+        "hydra.sweep.dir=" + str(tmpdir),
+        "hydra.job.chdir=True",
+        "hydra.sweeper.n_trials=20",
+        "hydra.sweeper.n_jobs=2",
+        "hydra/sweeper/sampler=random",
+        "hydra.sweeper.sampler.seed=123",
+        f"hydra.sweeper.max_failure_rate={max_failure_rate}",
+        "error=true",
+    ]
+    out, err = run_process(cmd, print_error=False, raise_exception=False)
+    error_string = "RuntimeError: cfg.error is True"
+    if max_failure_rate < 1.0:
+        assert error_string in err
+    else:
+        assert error_string not in err
+
+
+@mark.parametrize(
+    ("direction", "first_return"),
+    [
+        param("minimize", math.nan, id="nan"),
+        param("[minimize,minimize]", [1.0], id="wrong-number-of-values"),
+    ],
+)
+def test_rejected_result_marks_trial_failed(
+    hydra_sweep_runner: TSweepRunner, tmpdir: Path, direction: str, first_return: Any
+) -> None:
+    storage = "sqlite:///" + os.path.join(str(tmpdir), "test.db")
+    study_name = "test-rejected-result"
+    calls: list[DictConfig] = []
+
+    def task_function(cfg: DictConfig) -> Any:
+        calls.append(cfg)
+        if len(calls) == 1:
+            return first_return
+        return 1.0 if direction == "minimize" else [1.0, 1.0]
+
+    sweep = hydra_sweep_runner(
+        calling_file=None,
+        calling_module="hydra.test_utils.a_module",
+        task_function=task_function,
+        config_path="configs",
+        config_name="compose.yaml",
+        overrides=[
+            "hydra/sweeper=optuna",
+            "hydra/launcher=basic",
+            f"hydra.sweeper.direction={direction}",
+            "hydra.sweeper.n_trials=3",
+            "hydra.sweeper.n_jobs=1",
+            f"hydra.sweeper.storage={storage}",
+            f"hydra.sweeper.study_name={study_name}",
+        ],
+    )
+    with sweep:
+        study = optuna.load_study(storage=storage, study_name=study_name)
+        assert [t.state for t in study.trials] == [
+            optuna.trial.TrialState.FAIL,
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.COMPLETE,
+        ]
+
+
+def test_motpe_sampler_removed() -> None:
+    with raises(
+        ValueError,
+        match="The 'motpe' sampler was removed in Optuna 4.0",
+    ):
+        instantiate(
+            OmegaConf.structured(MOTPESamplerConfig),
+            _execution_whitelist_="hydra_plugins.hydra_optuna_sweeper.config.raise_motpe_removed",
+        )
+
+
+@mark.parametrize(
+    "config_type, sampler_type",
+    [
+        (NSGAIISamplerConfig, optuna.samplers.NSGAIISampler),
+        (NSGAIIISamplerConfig, optuna.samplers.NSGAIIISampler),
+    ],
+)
+@mark.parametrize("mutation", [None, sentinel.mutation])
+def test_nsga_sampler_mutation(
+    config_type: Any, sampler_type: Any, mutation: Any
+) -> None:
+    config = OmegaConf.structured(config_type, flags={"allow_objects": True})
+    assert config.mutation is None
+    config.mutation = mutation
+    with patch.object(sampler_type, "__init__", return_value=None) as constructor:
+        instantiate(
+            config,
+            _execution_whitelist_=(
+                "optuna.samplers.*",
+                "hydra_plugins.hydra_optuna_sweeper._impl.create_nsgaii_sampler",
+                "hydra_plugins.hydra_optuna_sweeper._impl.create_nsgaiii_sampler",
+            ),
+        )
+    constructor.assert_called_once()
+    if mutation is None:
+        assert "mutation" not in constructor.call_args.kwargs
+    else:
+        assert constructor.call_args.kwargs["mutation"] is mutation
+
+
+@mark.filterwarnings("default:NSGAIIISampler is experimental")
+def test_nsgaiii_sampler_reference_points_converted_to_array() -> None:
+    reference_points = [[0.0, 1.0], [1.0, 0.0]]
+    config = OmegaConf.structured(
+        NSGAIIISamplerConfig(reference_points=reference_points)
+    )
+
+    nsgaiii_sampler_constructor = optuna.samplers.NSGAIIISampler
+    with patch(
+        "optuna.samplers.NSGAIIISampler",
+        side_effect=nsgaiii_sampler_constructor,
+    ) as nsgaiii_sampler:
+        instantiate(
+            config,
+            _execution_whitelist_=(
+                "hydra_plugins.hydra_optuna_sweeper._impl.create_nsgaiii_sampler",
+                "optuna.samplers.*",
+            ),
+        )
+
+    actual = nsgaiii_sampler.call_args.kwargs["reference_points"]
+    assert isinstance(actual, numpy.ndarray)
+    numpy.testing.assert_array_equal(actual, reference_points)
+
+
+def test_example_with_removed_motpe(
+    tmpdir: Path,
+) -> None:
+    cmd = [
+        sys.executable,
+        "example/multi-objective.py",
+        "--multirun",
+        "--config-dir=tests/conf",
+        "--config-name=test_motpe",
+        "hydra.sweep.dir=" + str(tmpdir),
+        "hydra.job.chdir=True",
+        "hydra.sweeper.n_trials=20",
+        "hydra.sweeper.n_jobs=1",
+    ]
+
+    out, err = run_process(cmd, print_error=False, raise_exception=False)
+    assert "motpe" in err
+    assert "sampler was removed in Optuna 4.0" in err

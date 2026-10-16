@@ -1,0 +1,63 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# type: ignore
+import pathlib
+
+from setuptools import find_namespace_packages, setup
+
+from build_helpers.build_helpers import (
+    ANTLRCommand,
+    BuildPyCommand,
+    CleanCommand,
+    Develop,
+    SDistCommand,
+    find_version,
+)
+
+with pathlib.Path("requirements/requirements.txt").open() as requirements_txt:
+    install_requires = [
+        stripped
+        for line in requirements_txt
+        if (stripped := line.strip()) and not stripped.startswith("#")
+    ]
+
+
+with open("README.md") as fh:
+    LONG_DESC = fh.read()
+    setup(
+        cmdclass={
+            "antlr": ANTLRCommand,
+            "clean": CleanCommand,
+            "sdist": SDistCommand,
+            "build_py": BuildPyCommand,
+            "develop": Develop,
+        },
+        name="hydra-core",
+        version=find_version("hydra", "__init__.py"),
+        author="Omry Yadan",
+        author_email="omry@yadan.net",
+        description="A framework for elegantly configuring complex applications",
+        license="MIT",
+        license_files=["LICENSE", "ATTRIBUTION/LICENSE-antlr4"],
+        long_description=LONG_DESC,
+        long_description_content_type="text/markdown",
+        url="https://github.com/hydra-ecosystem/hydra",
+        keywords="command-line configuration yaml tab-completion",
+        packages=find_namespace_packages(include=["hydra", "hydra.*"]),
+        include_package_data=True,
+        classifiers=[
+            "Development Status :: 4 - Beta",
+            "Programming Language :: Python :: 3.10",
+            "Programming Language :: Python :: 3.11",
+            "Programming Language :: Python :: 3.12",
+            "Programming Language :: Python :: 3.13",
+            "Programming Language :: Python :: 3.14",
+            "Operating System :: POSIX :: Linux",
+            "Operating System :: MacOS",
+            "Operating System :: Microsoft :: Windows",
+        ],
+        python_requires=">=3.10",
+        install_requires=install_requires,
+        entry_points={"pytest11": ["hydra_pytest = hydra.extra.pytest_plugin"]},
+        # Install development dependencies with
+        # pip install -r requirements/dev.txt -e .
+    )

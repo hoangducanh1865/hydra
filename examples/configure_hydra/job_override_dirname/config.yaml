@@ -1,0 +1,8 @@
+hydra:
+  sweep:
+    dir: multirun
+    subdir: '${hydra_override_dirname:{exclude_keys: [seed]}}/seed=${seed}'
+
+learning_rate: 0.1
+batch_size: 32
+seed: 1

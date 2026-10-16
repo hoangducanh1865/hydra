@@ -1,0 +1,128 @@
+[tool.towncrier]
+    package = "hydra"
+    package_dir = ""
+    filename = "NEWS.md"
+    directory = "news/"
+    ignore = ["rc"]
+    title_format = "{version} ({project_date})"
+    template = "news/_template.rst"
+    issue_format = "[#{issue}](https://github.com/hydra-ecosystem/hydra/issues/{issue})"
+    start_string = "<!-- TOWNCRIER -->\n"
+
+  [[tool.towncrier.type]]
+  directory = "feature"
+  name = "Features"
+  showcontent = true
+
+  [[tool.towncrier.type]]
+  directory = "api_change"
+  name = "API Change (Renames, deprecations and removals)"
+  showcontent = true
+
+  [[tool.towncrier.type]]
+  directory = "bugfix"
+  name = "Bug Fixes"
+  showcontent = true
+
+  [[tool.towncrier.type]]
+  directory = "plugin"
+  name = "Plugins"
+  showcontent = true
+
+  [[tool.towncrier.type]]
+  directory = "config"
+  name = "Configuration structure changes"
+  showcontent = true
+
+  [[tool.towncrier.type]]
+  directory = "docs"
+  name = "Improved Documentation"
+  showcontent = true
+
+  [[tool.towncrier.type]]
+  directory = "maintenance"
+  name = "Maintenance Changes"
+  showcontent = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+include = ["*.py", "*.pyi"]
+extend-exclude = [
+    ".sl",
+    "hydra/grammar/gen",
+    "temp",
+    "tools/configen/example/gen",
+    "tools/configen/tests/test_modules/expected",
+    "website",
+]
+
+[tool.ruff.lint]
+exclude = [
+    "examples/plugins/example_configsource_plugin/hydra_plugins/example_configsource_plugin/example_configsource_plugin.py",
+    "hydra/test_utils/config_source_common_tests.py",
+    "tests/test_apps/config_source_test/structured.py",
+]
+fixable = ["I"]
+ignore = ["E203", "E231", "E241", "E701"]
+preview = true
+select = ["E", "F", "I", "W", "CPY"]
+
+[tool.ruff.lint.per-file-ignores]
+".github/docusaurus/**" = ["CPY001"]
+".stubs/**" = ["CPY001"]
+"examples/plugins/**" = ["I001"]
+"hydra/plugins/**" = ["I001"]
+"tests/instantiate/__init__.py" = ["F401"]
+
+[tool.ruff.lint.flake8-copyright]
+notice-rgx = '(?i)(Copyright \(c\) Facebook, Inc\. and its affiliates\. All Rights Reserved|SPDX-FileCopyrightText: Contributors to Hydra)'
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 119
+
+[tool.ruff.lint.isort]
+known-first-party = ["hydra", "hydra_app"]
+section-order = [
+    "future",
+    "standard-library",
+    "libs",
+    "third-party",
+    "first-party",
+    "local-folder",
+]
+
+[tool.ruff.lint.isort.sections]
+libs = ["setuptools"]
+
+[tool.pyrefly]
+project-includes = [
+    "noxfile.py",
+    "setup.py",
+    "build_helpers/**/*.py",
+    "hydra/**/*.py",
+    "tests/**/*.py",
+]
+project-excludes = [
+    "hydra/grammar/gen/**",
+    "tests/standalone_apps/**",
+    "tests/test_apps/**",
+]
+search-path = [
+    ".stubs",
+]
+ignore-missing-imports = [
+    "antlr4",
+    "antlr4.*",
+    "nevergrad",
+    "nevergrad.*",
+    "rq",
+    "rq.*",
+]
+replace-imports-with-any = [
+    "hydra.grammar.gen.*",
+]
+enabled-ignores = [
+    "type",
+    "pyrefly",
+]

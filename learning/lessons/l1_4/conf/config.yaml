@@ -1,0 +1,17 @@
+defaults:
+  # - _self_ # Use this line if want conf/*/*.yaml override config.yaml
+  - model: resnet
+  # - hidden: 128 # Code like below, as child of "model:"
+  - dataset: cifar
+  - _self_ # Use this line if want config.yaml override conf/*/*.yaml
+
+model:
+  hidden: 1
+
+lr: 0.001
+epochs: 3
+# batch_size: 64
+
+hydra:
+  run:
+    dir: ${oc.env:OUT_ROOT,/tmp/hydra_course}/l1_4/${now:%Y-%m-%d}/${now:%H-%M-%S}

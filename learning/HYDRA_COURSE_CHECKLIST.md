@@ -21,7 +21,7 @@ Goal: be able to start **every future research project** with a professional Hyd
 
 ## ✅ Master checklist
 
-**Progress: 3 / 28**
+**Progress: 6 / 28**
 
 ### Module 0 — Setup
 - [x] ✅ DONE — **0.1** Colab + GPU + install Hydra
@@ -29,9 +29,9 @@ Goal: be able to start **every future research project** with a professional Hyd
 ### Module 1 — Basics
 - [x] ✅ DONE — **1.1** Your first Hydra app (`@hydra.main`, `cfg`)
 - [x] ✅ DONE — **1.2** Command-line overrides (`key=v`, `+key`, `++key`, `~key`)
-- [ ] ⬜ TODO — **1.3** Output directories, working dir, `.hydra/` snapshot
-- [ ] ⬜ TODO — **1.4** Config groups & the defaults list
-- [ ] ⬜ TODO — **1.5** Interpolation & resolvers
+- [x] ✅ DONE — **1.3** Output directories, working dir, `.hydra/` snapshot
+- [x] ✅ DONE — **1.4** Config groups & the defaults list
+- [x] ✅ DONE — **1.5** Interpolation & resolvers
 - [ ] ⬜ TODO — **1.6** Mandatory values, struct mode & inspecting configs
 
 ### Module 2 — Multirun (sweeps)

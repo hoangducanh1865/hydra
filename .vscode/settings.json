@@ -5,5 +5,7 @@
         "**/node_modules/**": true,
         "**/multirun/**": true,
         "**/outputs/**": true
-    }
+    },
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

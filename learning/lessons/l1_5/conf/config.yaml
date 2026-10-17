@@ -1,0 +1,15 @@
+project: demo
+lr: 0.001
+epochs: 3
+model: {name: resnet18}
+warmup_steps: 50
+
+run_name: ${project}_${model.name}_lr${lr}_ep${epochs}       # interpolation: built from other keys
+data_dir: ${oc.env:DATA_DIR,/tmp/data}         # env var, with a default after the comma
+total_steps: ${mul:${epochs},100}              # custom resolver (defined in app.py)
+final_step: ${add:${total_steps},${warmup_steps}}
+stamp: ${now:%Y-%m-%d_%H-%M-%S}                # built-in Hydra resolver
+
+hydra:
+  run:
+    dir: ${oc.env:OUT_ROOT,/tmp/hydra_course}/l1_5/${now:%Y-%m-%d}/${now:%H-%M-%S}
